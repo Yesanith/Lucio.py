@@ -36,7 +36,6 @@ class LucioMusic(commands.Cog):
         self.control_messages = {}  # {message_id: guild_id}
         self.pending_updates = {}
         self.check_inactivity.start()
-        self.loop = asyncio.get_event_loop()
 
     def get_queue(self, guild_id):
         return self.queues[guild_id]
@@ -44,10 +43,7 @@ class LucioMusic(commands.Cog):
     async def search_youtube(self, query):
         try:
             ydl = youtube_dl.YoutubeDL(YDL_OPTIONS)
-            info = await self.loop.run_in_executor(
-                None, 
-                lambda: ydl.extract_info(query, download=False)
-            )
+            info = await asyncio.to_thread(ydl.extract_info, query, download=False)
             return {
                 'source': info['entries'][0]['url'],
                 'title': info['entries'][0]['title']
@@ -63,14 +59,14 @@ class LucioMusic(commands.Cog):
         return f"🎶 **LÚCIO:** {message} 🎧"
 
     async def update_control_panel(self, guild_id):
-        if guild_id not in {v for v in self.control_messages.values()}:
+        if guild_id not in self.control_messages.values():
             return
 
         message_id = next((k for k, v in self.control_messages.items() if v == guild_id), None)
         if not message_id:
             return
 
-        channel = self.bot.get_channel((await self.bot.get_channel(self.bot.get_guild(guild_id).text_channels[0].id)).id)
+        channel = self.bot.get_channel(self.bot.get_guild(guild_id).text_channels[0].id)
         
         try:
             message = await channel.fetch_message(message_id)
@@ -95,7 +91,6 @@ class LucioMusic(commands.Cog):
             del self.pending_updates[guild_id]
         
         self.pending_updates[guild_id] = asyncio.create_task(do_update())
-        await asyncio.sleep(0.3)
 
     async def create_control_panel(self, interaction):
         try:
@@ -126,18 +121,14 @@ class LucioMusic(commands.Cog):
             
             interaction.guild.voice_client.play(
                 discord.FFmpegPCMAudio(current['source'], **FFMPEG_OPTIONS),
-                after=lambda e: self.loop.create_task(self.play_next(interaction))
+                after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(interaction), self.bot.loop)
             )
             
             await interaction.channel.send(await self.lucio_say(f"New track dropping! **{current['title']}** 🎵"))
             
-            if any(k == guild_id for k in self.control_messages.values()):
-                await self.schedule_panel_update(guild_id)
-            else:
-                await self.create_control_panel(interaction)
+            await self.schedule_panel_update(guild_id)
         else:
-            if any(k == guild_id for k in self.control_messages.values()):
-                await self.schedule_panel_update(guild_id)
+            await self.schedule_panel_update(guild_id)
             await interaction.channel.send(await self.lucio_say("Queue empty! Time for an encore? 🎤"))
 
     @tasks.loop(seconds=30)

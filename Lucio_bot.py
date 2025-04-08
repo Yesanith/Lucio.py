@@ -5,11 +5,12 @@ import yt_dlp as youtube_dl
 import asyncio
 import datetime
 import os
+from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Lucio-themed settings
+# Optimized Lucio settings
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
@@ -18,36 +19,42 @@ YDL_OPTIONS = {
     'quiet': True,
     'geo-bypass': True,
     'source_address': '0.0.0.0',
-    'default_search': 'auto'
+    'default_search': 'ytsearch',
+    'socket_timeout': 10
 }
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -threads 2',
+    'options': '-vn -loglevel warning'
 }
 
 class LucioMusic(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.queues = {}
+        self.queues = defaultdict(list)
         self.last_activity = {}
-        self.control_messages = {}
+        self.control_messages = {}  # {message_id: guild_id}
+        self.pending_updates = {}
         self.check_inactivity.start()
+        self.loop = asyncio.get_event_loop()
 
     def get_queue(self, guild_id):
-        return self.queues.setdefault(guild_id, [])
+        return self.queues[guild_id]
 
     async def search_youtube(self, query):
         try:
-            with youtube_dl.YoutubeDL(YDL_OPTIONS) as ydl:
-                info = ydl.extract_info(f"ytsearch:{query}", download=False)
-                return {
-                    'source': info['entries'][0]['url'],
-                    'title': info['entries'][0]['title']
-                } if 'entries' in info else {
-                    'source': info['url'],
-                    'title': info['title']
-                }
+            ydl = youtube_dl.YoutubeDL(YDL_OPTIONS)
+            info = await self.loop.run_in_executor(
+                None, 
+                lambda: ydl.extract_info(query, download=False)
+            )
+            return {
+                'source': info['entries'][0]['url'],
+                'title': info['entries'][0]['title']
+            } if 'entries' in info else {
+                'source': info['url'],
+                'title': info['title']
+            }
         except Exception as e:
             print(f"Search error: {e}")
             return None
@@ -56,11 +63,14 @@ class LucioMusic(commands.Cog):
         return f"🎶 **LÚCIO:** {message} 🎧"
 
     async def update_control_panel(self, guild_id):
-        if guild_id not in self.control_messages:
+        if guild_id not in {v for v in self.control_messages.values()}:
             return
 
-        channel_id, message_id = self.control_messages[guild_id]
-        channel = self.bot.get_channel(channel_id)
+        message_id = next((k for k, v in self.control_messages.items() if v == guild_id), None)
+        if not message_id:
+            return
+
+        channel = self.bot.get_channel((await self.bot.get_channel(self.bot.get_guild(guild_id).text_channels[0].id)).id)
         
         try:
             message = await channel.fetch_message(message_id)
@@ -76,6 +86,17 @@ class LucioMusic(commands.Cog):
         except Exception as e:
             print(f"Control panel update error: {e}")
 
+    async def schedule_panel_update(self, guild_id):
+        if guild_id in self.pending_updates:
+            self.pending_updates[guild_id].cancel()
+        
+        async def do_update():
+            await self.update_control_panel(guild_id)
+            del self.pending_updates[guild_id]
+        
+        self.pending_updates[guild_id] = asyncio.create_task(do_update())
+        await asyncio.sleep(0.3)
+
     async def create_control_panel(self, interaction):
         try:
             queue = self.get_queue(interaction.guild.id)
@@ -86,7 +107,7 @@ class LucioMusic(commands.Cog):
             content += "\n\n*Let's turn up the beats!* 🎶"
             
             message = await interaction.channel.send(content)
-            self.control_messages[interaction.guild.id] = (interaction.channel.id, message.id)
+            self.control_messages[message.id] = interaction.guild.id
             
             controls = ['⏯️', '⏭️', '⏹️', '🔄']
             for emoji in controls:
@@ -105,18 +126,18 @@ class LucioMusic(commands.Cog):
             
             interaction.guild.voice_client.play(
                 discord.FFmpegPCMAudio(current['source'], **FFMPEG_OPTIONS),
-                after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(interaction), self.bot.loop)
+                after=lambda e: self.loop.create_task(self.play_next(interaction))
             )
             
             await interaction.channel.send(await self.lucio_say(f"New track dropping! **{current['title']}** 🎵"))
             
-            if guild_id in self.control_messages:
-                await self.update_control_panel(guild_id)
+            if any(k == guild_id for k in self.control_messages.values()):
+                await self.schedule_panel_update(guild_id)
             else:
                 await self.create_control_panel(interaction)
         else:
-            if guild_id in self.control_messages:
-                await self.update_control_panel(guild_id)
+            if any(k == guild_id for k in self.control_messages.values()):
+                await self.schedule_panel_update(guild_id)
             await interaction.channel.send(await self.lucio_say("Queue empty! Time for an encore? 🎤"))
 
     @tasks.loop(seconds=30)
@@ -132,15 +153,14 @@ class LucioMusic(commands.Cog):
                     if (datetime.datetime.now() - last_active).total_seconds() > 120:
                         await voice_client.disconnect()
                         self.queues[guild.id].clear()
-                        if guild.id in self.control_messages:
-                            channel_id, message_id = self.control_messages[guild.id]
-                            channel = self.bot.get_channel(channel_id)
+                        message_ids = [k for k, v in self.control_messages.items() if v == guild.id]
+                        for msg_id in message_ids:
+                            del self.control_messages[msg_id]
                             try:
-                                message = await channel.fetch_message(message_id)
-                                await message.delete()
+                                channel = self.bot.get_channel(guild.text_channels[0].id)
+                                await (await channel.fetch_message(msg_id)).delete()
                             except:
                                 pass
-                            del self.control_messages[guild.id]
                         await voice_client.channel.send(await self.lucio_say("Peace out! Catch you on the flip side! ✌️"))
                 else:
                     self.last_activity[guild.id] = datetime.datetime.now()
@@ -176,7 +196,7 @@ class LucioMusic(commands.Cog):
         voice_client = interaction.guild.voice_client or await interaction.user.voice.channel.connect()
         
         async with interaction.channel.typing():
-            song = await self.search_youtube(query)
+            song = await self.search_youtube(f"ytsearch:{query}")
             if not song:
                 return await interaction.followup.send(await self.lucio_say("Track not found! Let's try another vibe? 🎛️"))
 
@@ -220,23 +240,23 @@ class LucioMusic(commands.Cog):
         if interaction.guild.voice_client:
             await interaction.guild.voice_client.disconnect()
             self.queues[interaction.guild.id].clear()
-            if interaction.guild.id in self.control_messages:
-                channel_id, message_id = self.control_messages[interaction.guild.id]
-                channel = self.bot.get_channel(channel_id)
+            message_ids = [k for k, v in self.control_messages.items() if v == interaction.guild.id]
+            for msg_id in message_ids:
+                del self.control_messages[msg_id]
                 try:
-                    message = await channel.fetch_message(message_id)
-                    await message.delete()
+                    channel = self.bot.get_channel(interaction.channel.id)
+                    await (await channel.fetch_message(msg_id)).delete()
                 except:
                     pass
-                del self.control_messages[interaction.guild.id]
             await interaction.response.send_message(await self.lucio_say("Shutting down! Keep the rhythm alive! 🎶"))
 
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction, user):
-        if user.bot or reaction.message.id not in [msg[1] for msg in self.control_messages.values()]:
+        if user.bot or reaction.message.id not in self.control_messages:
             return
 
-        guild = reaction.message.guild
+        guild_id = self.control_messages[reaction.message.id]
+        guild = self.bot.get_guild(guild_id)
         voice_client = guild.voice_client
         
         try:
@@ -245,19 +265,19 @@ class LucioMusic(commands.Cog):
                     voice_client.resume()
                 else:
                     voice_client.pause()
-                await self.update_control_panel(guild.id)
+                await self.schedule_panel_update(guild_id)
                 
             elif str(reaction.emoji) == '⏭️':
                 voice_client.stop()
                 
             elif str(reaction.emoji) == '⏹️':
                 await voice_client.disconnect()
-                self.queues[guild.id].clear()
+                self.queues[guild_id].clear()
                 await reaction.message.delete()
-                del self.control_messages[guild.id]
+                del self.control_messages[reaction.message.id]
                 
             elif str(reaction.emoji) == '🔄':
-                await self.update_control_panel(guild.id)
+                await self.schedule_panel_update(guild_id)
             
             await reaction.remove(user)
             
